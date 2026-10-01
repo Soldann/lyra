@@ -30,6 +30,8 @@ export CXX="$CONDA_PREFIX/bin/x86_64-conda-linux-gnu-g++"
 pip install --no-deps -r requirements.txt
 pip install "git+https://github.com/microsoft/MoGe.git"
 pip install --no-build-isolation "transformer_engine[pytorch]"
+pip install "gdown<6"
+
 # Symlink cuda_runtime as cudart for transformer_engine compatibility
 SITE=$CONDA_PREFIX/lib/python3.10/site-packages
 ln -sf "$SITE/nvidia/cuda_runtime" "$SITE/nvidia/cudart"
