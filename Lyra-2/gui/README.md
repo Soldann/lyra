@@ -59,6 +59,13 @@ bash gui/scripts/setup_dependencies.sh
 pip install -r gui/requirements.txt
 
 export CMAKE_PREFIX_PATH="$CONDA_PREFIX${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
+export CPATH="$CONDA_PREFIX/include:$CPATH"
+export CPLUS_INCLUDE_PATH=/usr/include:$CPLUS_INCLUDE_PATH
+export C_INCLUDE_PATH=/usr/include:$C_INCLUDE_PATH
+export C_INCLUDE_PATH=/usr/include/x86_64-linux-gnu:/usr/include
+export CPLUS_INCLUDE_PATH=/usr/include/x86_64-linux-gnu:/usr/include
+
+
 cmake gui -B gui/build \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DNGP_BUILD_WITH_PYTHON_BINDINGS=ON \
