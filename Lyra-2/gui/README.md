@@ -61,7 +61,8 @@ pip install -r gui/requirements.txt
 export CMAKE_PREFIX_PATH="$CONDA_PREFIX${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
 cmake gui -B gui/build \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-  -DNGP_BUILD_WITH_PYTHON_BINDINGS=ON
+  -DNGP_BUILD_WITH_PYTHON_BINDINGS=ON \
+  -DCMAKE_POLICY_VERSION_MINIMUM=3.5
 cmake --build gui/build --config RelWithDebInfo -j
 ```
 
