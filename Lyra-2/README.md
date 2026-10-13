@@ -48,7 +48,7 @@ Download the pretrained checkpoints from [HuggingFace](https://huggingface.co/nv
 pip install huggingface_hub
 
 # Download all checkpoints into the checkpoints/ directory
-huggingface-cli download nvidia/Lyra-2.0 --include "checkpoints/*" --local-dir .
+hf download nvidia/Lyra-2.0 --include "checkpoints/*" --local-dir .
 ```
 
 ### Step 1 — Generate Video
