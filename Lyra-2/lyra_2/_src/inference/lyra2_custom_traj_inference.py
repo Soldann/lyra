@@ -142,6 +142,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--lora_paths", type=str, default=None, nargs="+")
     parser.add_argument("--lora_weights", type=float, default=None, nargs="+")
     parser.add_argument("--offload", action="store_true")
+    parser.add_argument("--offload_vae", action="store_true")
     parser.add_argument("--offload_when_prompt", action="store_true")
     parser.add_argument("--debug", action="store_true")
 
@@ -206,6 +207,12 @@ def _apply_dmd_defaults(args):
 if __name__ == "__main__":
     args = parse_arguments()
     _apply_dmd_defaults(args)
+    if args.offload:
+        os.environ["LYRA_MODEL_INIT_DEVICE"] = "cpu"
+        os.environ["LYRA_SKIP_MODEL_DEVICE_MOVE"] = "1"
+        args.offload_da3_model = True
+
+    print(f"Loading models with offload settings: offload {args.offload}, vae {args.offload_vae}, offload_when_prompt {args.offload_when_prompt}, offload_da3_diffusion {args.offload_da3_diffusion}")
 
     if args.debug:
         import debugpy
@@ -230,6 +237,7 @@ if __name__ == "__main__":
     )
 
     # ---- Load FramePack model ----
+    print("Loading FramePack model...")
     experiment_opts = [
         "model.config.use_mp_policy_fsdp=False",
         "model.config.keep_original_net_dtype=False",
@@ -257,8 +265,10 @@ if __name__ == "__main__":
     desired_dtype = model.tensor_kwargs.get("dtype", None)
     desired_device = model.tensor_kwargs.get("device", None)
     if desired_dtype is not None:
-        model.net = model.net.to(device=desired_device, dtype=desired_dtype)
+        model.net = model.net.to(device="cpu", dtype=desired_dtype)
         log.info(f"Casted model.net to dtype={desired_dtype}", rank0_only=True)
+    else:
+        model.net.cpu()
 
     assert getattr(model.config, "important_start", True) is True
     assert getattr(model.config, "encode_video_from_start", True) is True
@@ -276,8 +286,9 @@ if __name__ == "__main__":
     target_h, target_w = [int(x) for x in args.resolution.split(",")]
 
     # ---- Load DA3 model ----
+    print("Loading DA3 model...")
     from lyra_2._src.inference.depth_utils import load_da3_model
-    da3_device = model.tensor_kwargs.get("device", "cuda" if torch.cuda.is_available() else "cpu")
+    da3_device = "cpu"
     da3_model = load_da3_model(
         da3_model_name=args.da3_model_name,
         da3_model_path_custom=args.da3_model_path_custom,
@@ -288,8 +299,9 @@ if __name__ == "__main__":
     # ---- Optionally load MoGe model for depth scale alignment ----
     moge_model = None
     if args.use_moge_scale:
+        print("Loading MoGE model...")
         from lyra_2._src.inference.depth_utils import load_moge_model
-        moge_device = model.tensor_kwargs.get("device", "cuda" if torch.cuda.is_available() else "cpu")
+        moge_device = "cpu"
         moge_model = load_moge_model(moge_device)
         moge_model.eval()
         log.info("MoGe model loaded for depth scale alignment.", rank0_only=True)
@@ -340,11 +352,17 @@ if __name__ == "__main__":
 
         # ---- Depth & intrinsics for the first frame (via DA3) ----
         log.info("Running DA3 single-image depth...", rank0_only=True)
-        image_chw01, depth_hw, _K_33_da3, mask_hw = _da3_infer_depth_intrinsics_single(
-            da3_model=da3_model,
-            img_rgb_uint8=rgb_t,
-            target_hw=(target_h, target_w),
-        )
+        da3_model.to(desired_device)
+        try:
+            image_chw01, depth_hw, _K_33_da3, mask_hw = _da3_infer_depth_intrinsics_single(
+                da3_model=da3_model,
+                img_rgb_uint8=rgb_t,
+                target_hw=(target_h, target_w),
+            )
+        finally:
+            da3_model.to("cpu")
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         H, W = image_chw01.shape[-2:]
 
         # ---- Optionally align DA3 depth to MoGe scale ----
@@ -353,15 +371,18 @@ if __name__ == "__main__":
             from lyra_2._src.inference.depth_utils import moge_infer_depth_intrinsics
 
             moge_model.to(desired_device)
-            with torch.nn.attention.sdpa_kernel(
-                [torch.nn.attention.SDPBackend.MATH]
-            ):
-                _, moge_depth_hw, _, moge_mask_hw = moge_infer_depth_intrinsics(
-                    moge_model,
-                    rgb_t,
-                    depth_pred_hw=(target_h, target_w),
-                    target_hw=(target_h, target_w),
-                )
+            try:
+                with torch.nn.attention.sdpa_kernel(
+                    [torch.nn.attention.SDPBackend.MATH]
+                ):
+                    _, moge_depth_hw, _, moge_mask_hw = moge_infer_depth_intrinsics(
+                        moge_model,
+                        rgb_t,
+                        depth_pred_hw=(target_h, target_w),
+                        target_hw=(target_h, target_w),
+                    )
+            finally:
+                moge_model.cpu()
 
             da3_d = depth_hw.to(moge_depth_hw.device)
             da3_m = mask_hw.to(moge_mask_hw.device)
@@ -389,7 +410,6 @@ if __name__ == "__main__":
             else:
                 log.warning("Not enough overlapping valid pixels for scale alignment.", rank0_only=True)
 
-            moge_model.cpu()
             del moge_depth_hw, moge_mask_hw, da3_d, da3_m
             torch.cuda.empty_cache()
             gc.collect()

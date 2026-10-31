@@ -144,6 +144,7 @@ class WANDiffusionModel(ImaginaireModel):
             "bfloat16": torch.bfloat16,
         }[config.precision]
         self.tensor_kwargs = {"device": "cuda", "dtype": self.precision}
+        self.model_init_device = os.environ.get("LYRA_MODEL_INIT_DEVICE", "cuda")
         self.flow_matching_kwargs = {"device": "cuda", "dtype": torch.float32}
 
         log.warning(f"DiffusionModel: precision {self.precision}")
@@ -249,8 +250,8 @@ class WANDiffusionModel(ImaginaireModel):
                 net.fully_shard(mesh=self.fsdp_device_mesh)
                 net = fully_shard(net, mesh=self.fsdp_device_mesh, reshard_after_forward=True)
 
-            with misc.timer("meta to cuda and broadcast model states"):
-                net.to_empty(device="cuda")
+            with misc.timer("meta to device and broadcast model states"):
+                net.to_empty(device=self.model_init_device)
                 net.init_weights()
 
             if self.fsdp_device_mesh:
@@ -322,7 +323,10 @@ class WANDiffusionModel(ImaginaireModel):
             self.net_ema.to(dtype=torch.float32)
         if hasattr(self.tokenizer, "reset_dtype"):
             self.tokenizer.reset_dtype()
-        self.net = self.net.to(memory_format=memory_format, **self.tensor_kwargs)
+        if os.environ.get("LYRA_SKIP_MODEL_DEVICE_MOVE") != "1":
+            self.net = self.net.to(memory_format=memory_format, **self.tensor_kwargs)
+        else:
+            self.net = self.net.to(memory_format=memory_format)
 
         if hasattr(self.config, "use_torch_compile") and self.config.use_torch_compile:  # compatible with old config
             if torch.__version__ < "2.3":

@@ -399,8 +399,35 @@ def _offload_diffusion_to_cpu(model, enable_offload: bool):
 
 def _restore_diffusion_to_gpu(model, enable_offload: bool):
     """Move diffusion model back to GPU if offload is enabled."""
-    if enable_offload and hasattr(model, 'net'):
+    if (
+        enable_offload
+        and hasattr(model, "net")
+        and not getattr(model, "_forward_offload_enabled", False)
+    ):
         model.net.to(model.tensor_kwargs.get("device", "cuda"))
+
+
+def _enable_forward_offload(model, enable_offload: bool):
+    """Keep the diffusion network on CPU except during its forward calls."""
+    if not enable_offload or not hasattr(model, "net"):
+        return
+    if getattr(model, "_forward_offload_enabled", False):
+        return
+
+    device = model.tensor_kwargs.get("device", "cuda")
+
+    def move_to_device(module, _inputs):
+        module.to(device)
+
+    def move_to_cpu(module, _inputs, _output):
+        module.to("cpu")
+
+    model._forward_offload_handles = (
+        model.net.register_forward_pre_hook(move_to_device),
+        model.net.register_forward_hook(move_to_cpu),
+    )
+    model._forward_offload_enabled = True
+    model.net.cpu()
 
 
 def safe_to(obj, device=None, dtype=None, skip_keys: set | None = None):
@@ -1430,6 +1457,7 @@ def run_lyra2_sample(
     vipe_input_dump_dir=None,
 ):
     """Shared Lyra2 autoregressive generation logic for a single prepared sample."""
+    _enable_forward_offload(model, bool(getattr(args, "offload", False)))
     model._normalize_video_databatch_inplace(data_batch)
 
     cp_group = None

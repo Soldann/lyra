@@ -67,7 +67,7 @@ def load_model_from_checkpoint(
         # disable fsdp
         config.model.config.fsdp_shard_size = 1
     with misc.timer("instantiate model"):
-        model = instantiate(config.model).cuda()
+        model = instantiate(config.model)
         # Convert the model parameters to bf16
         model.on_train_start()
 

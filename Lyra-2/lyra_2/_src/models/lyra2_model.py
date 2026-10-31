@@ -281,8 +281,8 @@ class Lyra2Model(WANDiffusionModel):
                 net.fully_shard(mesh=self.fsdp_device_mesh, **fsdp_kwargs)
                 net = fully_shard(net, mesh=self.fsdp_device_mesh, reshard_after_forward=True, **fsdp_kwargs)
 
-            with misc.timer("meta to cuda and broadcast model states"):
-                net.to_empty(device="cuda")
+            with misc.timer("meta to device and broadcast model states"):
+                net.to_empty(device=self.model_init_device)
                 net.init_weights()
 
             if self.fsdp_device_mesh:
