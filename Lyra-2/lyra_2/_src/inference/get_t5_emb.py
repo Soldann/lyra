@@ -541,14 +541,21 @@ t5_encoder: Optional[UMT5EncoderModel] = None
 _t5_offloaded: Optional[UMT5EncoderModel] = None
 
 
+DEFAULT_T5_CHECKPOINT_PATH = "./checkpoints/text_encoder/encoder.pth"
+
+
 def get_umt5_embedding(
     prompts: Union[str, List[str]],
     device: str = "cuda",
     max_length: int = 512,
+    checkpoint_path: Optional[str] = None,
 ) -> torch.Tensor:
     global t5_encoder
     if t5_encoder is None:
-        t5_encoder = UMT5EncoderModel(device=device)
+        t5_encoder = UMT5EncoderModel(
+            device=device,
+            checkpoint_path=checkpoint_path or DEFAULT_T5_CHECKPOINT_PATH,
+        )
     return t5_encoder(prompts, device=device)
 
 
@@ -557,13 +564,18 @@ def get_umt5_embedding_offloaded(
     prompts: Union[str, List[str]],
     device: str = "cuda",
     max_length: int = 512,
+    checkpoint_path: Optional[str] = None,
 ) -> torch.Tensor:
     """
     Load UMT5 encoder on CPU only, move to CUDA just for the call, then back to CPU and clear CUDA cache.
     """
     global _t5_offloaded
     if _t5_offloaded is None:
-        _t5_offloaded = UMT5EncoderModel(device="cpu", load_on_cpu=True)
+        _t5_offloaded = UMT5EncoderModel(
+            device="cpu",
+            checkpoint_path=checkpoint_path or DEFAULT_T5_CHECKPOINT_PATH,
+            load_on_cpu=True,
+        )
     _t5_offloaded.model.to(device)
     _t5_offloaded.device = device
     emb = _t5_offloaded(prompts, device=device)

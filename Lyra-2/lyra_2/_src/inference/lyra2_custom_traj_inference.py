@@ -126,7 +126,12 @@ def parse_arguments() -> argparse.Namespace:
 
     # Model and generation
     parser.add_argument("--experiment", type=str, default="lyra_framepack_spatial")
-    parser.add_argument("--checkpoint_dir", type=str, default="checkpoints/model")
+    parser.add_argument(
+        "--checkpoint_dir",
+        type=str,
+        default="checkpoints",
+        help="Root directory containing model/, lora/, and text_encoder/.",
+    )
     parser.add_argument("--output_path", type=str, default="inference/lyra2_custom_traj")
     parser.add_argument("--guidance", type=float, default=5.0)
     parser.add_argument("--shift", type=float, default=5.0)
@@ -179,7 +184,7 @@ def parse_arguments() -> argparse.Namespace:
 # Main
 # ---------------------------------------------------------------------------
 
-DMD_LORA_PATH = "checkpoints/lora/dmd_distillation.safetensors"
+DMD_LORA_FILENAME = "dmd_distillation.safetensors"
 DMD_LORA_WEIGHT = 1.0
 
 
@@ -196,10 +201,13 @@ def _apply_dmd_defaults(args):
         args.lora_paths = []
     if args.lora_weights is None:
         args.lora_weights = []
-    args.lora_paths.append(DMD_LORA_PATH)
+    dmd_lora_path = os.path.join(
+        args.checkpoint_dir, "lora", DMD_LORA_FILENAME
+    )
+    args.lora_paths.append(dmd_lora_path)
     args.lora_weights.append(DMD_LORA_WEIGHT)
     log.info(
-        f"[DMD] Enabled: lora={DMD_LORA_PATH}, scheduler=dmd (4 fixed steps)",
+        f"[DMD] Enabled: lora={dmd_lora_path}, scheduler=dmd (4 fixed steps)",
         rank0_only=True,
     )
 
@@ -231,9 +239,16 @@ if __name__ == "__main__":
     os.makedirs(args.output_path, exist_ok=True)
     misc.set_random_seed(seed=args.seed, by_rank=True)
 
+    negative_prompt_path = os.path.join(
+        args.checkpoint_dir, "text_encoder", "negative_prompt.pt"
+    )
+    t5_checkpoint_path = os.path.join(
+        args.checkpoint_dir, "text_encoder", "encoder.pth"
+    )
+
     # Negative prompt embeddings
     negative_prompt_data = torch.load(
-        "checkpoints/text_encoder/negative_prompt.pt", map_location="cpu", weights_only=False
+        negative_prompt_path, map_location="cpu", weights_only=False
     )
 
     # ---- Load FramePack model ----
@@ -247,7 +262,7 @@ if __name__ == "__main__":
     model, config = load_model_from_checkpoint(
         config_file="lyra_2/_src/configs/config.py",
         experiment_name=args.experiment,
-        checkpoint_path=args.checkpoint_dir,
+        checkpoint_path=os.path.join(args.checkpoint_dir, "model"),
         enable_fsdp=False,
         instantiate_ema=False,
         load_ema_to_reg=False,
@@ -417,7 +432,10 @@ if __name__ == "__main__":
         img_bchw = image_chw01.to(device=desired_device) * 2.0 - 1.0
 
         # ---- Load captions ----
-        from lyra_2._src.inference.get_t5_emb import get_umt5_embedding, get_umt5_embedding_offloaded
+        from lyra_2._src.inference.get_t5_emb import (
+            get_umt5_embedding,
+            get_umt5_embedding_offloaded,
+        )
         neg_t5 = misc.to(negative_prompt_data["t5_text_embeddings"], **model.tensor_kwargs)
 
         captions_file = None
@@ -448,9 +466,17 @@ if __name__ == "__main__":
                     if args.prompt_suffix:
                         cap = cap.rstrip() + " " + args.prompt_suffix
                     if args.offload_when_prompt:
-                        emb = get_umt5_embedding_offloaded(cap, device=desired_device).to(dtype=desired_dtype)
+                        emb = get_umt5_embedding_offloaded(
+                            cap,
+                            device=desired_device,
+                            checkpoint_path=t5_checkpoint_path,
+                        ).to(dtype=desired_dtype)
                     else:
-                        emb = get_umt5_embedding(cap, device=desired_device).to(dtype=desired_dtype)
+                        emb = get_umt5_embedding(
+                            cap,
+                            device=desired_device,
+                            checkpoint_path=t5_checkpoint_path,
+                        ).to(dtype=desired_dtype)
                     if emb.dim() == 3:
                         emb = emb[0]
                     S, D = emb.shape
@@ -493,9 +519,17 @@ if __name__ == "__main__":
             if args.prompt_suffix:
                 caption = caption.rstrip() + " " + args.prompt_suffix
             if args.offload_when_prompt:
-                t5 = get_umt5_embedding_offloaded(caption, device=desired_device).to(dtype=desired_dtype)
+                t5 = get_umt5_embedding_offloaded(
+                    caption,
+                    device=desired_device,
+                    checkpoint_path=t5_checkpoint_path,
+                ).to(dtype=desired_dtype)
             else:
-                t5 = get_umt5_embedding(caption, device=desired_device).to(dtype=desired_dtype)
+                t5 = get_umt5_embedding(
+                    caption,
+                    device=desired_device,
+                    checkpoint_path=t5_checkpoint_path,
+                ).to(dtype=desired_dtype)
             if t5.dim() == 2:
                 t5 = t5.unsqueeze(0)
             elif t5.dim() == 3 and t5.shape[0] != 1:
