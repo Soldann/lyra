@@ -15,6 +15,7 @@
 
 import html
 import math
+import os
 import string
 from typing import List, Optional, Union
 
@@ -564,7 +565,12 @@ def get_umt5_embedding_offloaded(
     global _t5_offloaded
     if _t5_offloaded is None:
         _t5_offloaded = UMT5EncoderModel(device="cpu", load_on_cpu=True)
-    _t5_offloaded.model.to(device)
+    if os.environ.get("LYRA_SEQUENTIAL_CPU_OFFLOAD") == "1":
+        from lyra_2._src.inference.lyra2_ar_inference import enable_sequential_cpu_offload
+
+        enable_sequential_cpu_offload(_t5_offloaded.model, device)
+    else:
+        _t5_offloaded.model.to(device)
     _t5_offloaded.device = device
     emb = _t5_offloaded(prompts, device=device)
     _t5_offloaded.model.to("cpu")

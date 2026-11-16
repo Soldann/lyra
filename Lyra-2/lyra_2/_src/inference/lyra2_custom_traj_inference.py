@@ -39,6 +39,9 @@ import torch.nn.functional as F
 from lyra_2._ext.imaginaire.utils import log, misc
 from lyra_2._ext.imaginaire.visualize.video import save_img_or_video
 from lyra_2._src.inference.lyra2_ar_inference import (
+    enable_module_dtype_alignment,
+    enable_model_cpu_offload,
+    enable_sequential_cpu_offload,
     save_output,
     safe_to,
     run_lyra2_sample,
@@ -51,7 +54,7 @@ from lyra_2._src.utils.model_loader import load_model_from_checkpoint
 
 torch.enable_grad(False)
 torch.backends.cudnn.enabled = False
-
+import wandb
 
 # ---------------------------------------------------------------------------
 # Trajectory loading
@@ -143,6 +146,11 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--lora_weights", type=float, default=None, nargs="+")
     parser.add_argument("--offload", action="store_true")
     parser.add_argument("--offload_vae", action="store_true")
+    parser.add_argument(
+        "--sequential_cpu_offload",
+        action="store_true",
+        help="Move each parameterized model layer to GPU only for its forward pass.",
+    )
     parser.add_argument("--offload_when_prompt", action="store_true")
     parser.add_argument("--debug", action="store_true")
 
@@ -211,9 +219,15 @@ if __name__ == "__main__":
         os.environ["LYRA_MODEL_INIT_DEVICE"] = "cpu"
         os.environ["LYRA_SKIP_MODEL_DEVICE_MOVE"] = "1"
         args.offload_da3_model = True
+    if args.sequential_cpu_offload:
+        args.offload = True
+        args.offload_vae = True
+        os.environ["LYRA_MODEL_INIT_DEVICE"] = "cpu"
+        os.environ["LYRA_SKIP_MODEL_DEVICE_MOVE"] = "1"
+        os.environ["LYRA_SEQUENTIAL_CPU_OFFLOAD"] = "1"
 
     print(f"Loading models with offload settings: offload {args.offload}, vae {args.offload_vae}, offload_when_prompt {args.offload_when_prompt}, offload_da3_diffusion {args.offload_da3_diffusion}")
-
+    wandb.init(project="lyra2", config=vars(args))
     if args.debug:
         import debugpy
         debugpy.listen(5678)
@@ -269,6 +283,9 @@ if __name__ == "__main__":
         log.info(f"Casted model.net to dtype={desired_dtype}", rank0_only=True)
     else:
         model.net.cpu()
+    if args.sequential_cpu_offload:
+        enable_sequential_cpu_offload(model.net, desired_device)
+        enable_sequential_cpu_offload(getattr(model, "conditioner", None), desired_device)
 
     assert getattr(model.config, "important_start", True) is True
     assert getattr(model.config, "encode_video_from_start", True) is True
@@ -294,7 +311,17 @@ if __name__ == "__main__":
         da3_model_path_custom=args.da3_model_path_custom,
         device=da3_device,
     )
+    if args.sequential_cpu_offload:
+        # DA3 runs under CUDA autocast, which produces BF16 activations. Keep
+        # its CPU-resident parameters in the same dtype before staging layers.
+        da3_model.to(device="cpu", dtype=torch.bfloat16)
     da3_model.eval()
+    if args.sequential_cpu_offload:
+        # inference() calls the wrapped network directly, bypassing the
+        # DepthAnything3 wrapper's forward hooks.
+        enable_model_cpu_offload(da3_model.model, desired_device)
+        enable_module_dtype_alignment(da3_model.model)
+        da3_model.device = torch.device(desired_device)
 
     # ---- Optionally load MoGe model for depth scale alignment ----
     moge_model = None
@@ -304,6 +331,8 @@ if __name__ == "__main__":
         moge_device = "cpu"
         moge_model = load_moge_model(moge_device)
         moge_model.eval()
+        if args.sequential_cpu_offload:
+            enable_sequential_cpu_offload(moge_model, desired_device)
         log.info("MoGe model loaded for depth scale alignment.", rank0_only=True)
 
     # ---- Resolve image(s) ----
@@ -352,7 +381,8 @@ if __name__ == "__main__":
 
         # ---- Depth & intrinsics for the first frame (via DA3) ----
         log.info("Running DA3 single-image depth...", rank0_only=True)
-        da3_model.to(desired_device)
+        if not args.sequential_cpu_offload:
+            da3_model.to(desired_device)
         try:
             image_chw01, depth_hw, _K_33_da3, mask_hw = _da3_infer_depth_intrinsics_single(
                 da3_model=da3_model,
@@ -360,7 +390,8 @@ if __name__ == "__main__":
                 target_hw=(target_h, target_w),
             )
         finally:
-            da3_model.to("cpu")
+            if not args.sequential_cpu_offload:
+                da3_model.to("cpu")
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
         H, W = image_chw01.shape[-2:]
@@ -370,7 +401,8 @@ if __name__ == "__main__":
             log.info("Aligning DA3 depth to MoGe scale...", rank0_only=True)
             from lyra_2._src.inference.depth_utils import moge_infer_depth_intrinsics
 
-            moge_model.to(desired_device)
+            if not args.sequential_cpu_offload:
+                moge_model.to(desired_device)
             try:
                 with torch.nn.attention.sdpa_kernel(
                     [torch.nn.attention.SDPBackend.MATH]
@@ -382,7 +414,8 @@ if __name__ == "__main__":
                         target_hw=(target_h, target_w),
                     )
             finally:
-                moge_model.cpu()
+                if not args.sequential_cpu_offload:
+                    moge_model.cpu()
 
             da3_d = depth_hw.to(moge_depth_hw.device)
             da3_m = mask_hw.to(moge_mask_hw.device)

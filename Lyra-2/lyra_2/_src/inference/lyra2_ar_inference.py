@@ -50,12 +50,16 @@ def _move_vae_cache(cache, device):
 
 def _move_vae_encoder(vae_core, device):
     """Move the streaming VAE encoder and its latent projection together."""
+    if getattr(vae_core, "_sequential_cpu_offload_handles", None):
+        return
     vae_core.encoder.to(device)
     vae_core.conv1.to(device)
 
 
 def _move_vae_decoder(vae_core, device, *, layerwise=False):
     """Move the streaming VAE decoder and its latent projection together."""
+    if getattr(vae_core, "_sequential_cpu_offload_handles", None):
+        return
     vae_core.conv2.to(device)
     if layerwise:
         # Decoder layers are staged to the GPU immediately before use by
@@ -403,13 +407,18 @@ def _restore_diffusion_to_gpu(model, enable_offload: bool):
         enable_offload
         and hasattr(model, "net")
         and not getattr(model, "_forward_offload_enabled", False)
+        and not getattr(model.net, "_sequential_cpu_offload_handles", None)
     ):
         model.net.to(model.tensor_kwargs.get("device", "cuda"))
 
 
 def _enable_forward_offload(model, enable_offload: bool):
     """Keep the diffusion network on CPU except during its forward calls."""
-    if not enable_offload or not hasattr(model, "net"):
+    if (
+        not enable_offload
+        or not hasattr(model, "net")
+        or getattr(model.net, "_sequential_cpu_offload_handles", None)
+    ):
         return
     if getattr(model, "_forward_offload_enabled", False):
         return
@@ -428,6 +437,118 @@ def _enable_forward_offload(model, enable_offload: bool):
     )
     model._forward_offload_enabled = True
     model.net.cpu()
+
+
+def enable_sequential_cpu_offload(module, device):
+    """Move one parameterized leaf module to ``device`` only for its forward."""
+    if not isinstance(module, torch.nn.Module):
+        return []
+    if getattr(module, "_sequential_cpu_offload_handles", None):
+        return module._sequential_cpu_offload_handles
+
+    units = list(module.modules())
+
+    handles = []
+    for unit in units:
+        direct_params = list(unit.parameters(recurse=False))
+        direct_buffers = list(unit.buffers(recurse=False))
+        state = direct_params or direct_buffers
+        target_dtype = state[0].dtype if state and state[0].is_floating_point() else None
+
+        def move_direct_state(current, target=device, dtype=target_dtype):
+            for parameter in current.parameters(recurse=False):
+                parameter.data = parameter.data.to(
+                    device=target,
+                    dtype=dtype if dtype is not None and parameter.is_floating_point() else parameter.dtype,
+                )
+            for name, buffer in current.named_buffers(recurse=False):
+                if buffer is not None:
+                    current._buffers[name] = buffer.to(
+                        device=target,
+                        dtype=dtype if dtype is not None and buffer.is_floating_point() else buffer.dtype,
+                    )
+
+        def move_to_device(current, inputs, target=device, dtype=target_dtype):
+            move_direct_state(current, target, dtype)
+            return tuple(
+                (
+                    value.to(
+                        device=target,
+                        dtype=dtype if dtype is not None and value.is_floating_point() else value.dtype,
+                    )
+                    if torch.is_tensor(value)
+                    else value
+                )
+                for value in inputs
+            )
+
+        def move_to_cpu(current, _inputs, _output):
+            move_direct_state(current, "cpu", target_dtype)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        handles.extend(
+            (
+                unit.register_forward_pre_hook(move_to_device),
+                unit.register_forward_hook(move_to_cpu),
+            )
+        )
+    module.cpu()
+    module._sequential_cpu_offload_handles = handles
+    return handles
+
+
+def enable_model_cpu_offload(module, device):
+    """Keep a composite model on CPU except while its top-level forward runs."""
+    if not isinstance(module, torch.nn.Module):
+        return []
+    if getattr(module, "_model_cpu_offload_handles", None):
+        return module._model_cpu_offload_handles
+
+    def move_to_device(current, _inputs):
+        current.to(device)
+
+    def move_to_cpu(current, _inputs, _output):
+        current.to("cpu")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    handles = (
+        module.register_forward_pre_hook(move_to_device),
+        module.register_forward_hook(move_to_cpu),
+    )
+    if hasattr(module, "device"):
+        module.device = torch.device(device)
+    module.cpu()
+    module._model_cpu_offload_handles = handles
+    return handles
+
+
+def enable_module_dtype_alignment(module):
+    """Cast floating inputs to each module's direct parameter dtype."""
+    if not isinstance(module, torch.nn.Module):
+        return []
+    if getattr(module, "_dtype_alignment_handles", None):
+        return module._dtype_alignment_handles
+
+    handles = []
+    for unit in module.modules():
+        state = list(unit.parameters(recurse=False)) + list(unit.buffers(recurse=False))
+        floating_state = next((value for value in state if value.is_floating_point()), None)
+        if floating_state is None:
+            continue
+        target_dtype = floating_state.dtype
+
+        def align_inputs(_current, inputs, dtype=target_dtype):
+            return tuple(
+                value.to(dtype=dtype) if torch.is_tensor(value) and value.is_floating_point() else value
+                for value in inputs
+            )
+
+        handles.append(unit.register_forward_pre_hook(align_inputs))
+
+    module._dtype_alignment_handles = handles
+    return handles
 
 
 def safe_to(obj, device=None, dtype=None, skip_keys: set | None = None):
@@ -524,6 +645,8 @@ class Lyra2InferencePipeline:
         init_video = first_frame.repeat(1, 1, self.repeat_pixels, 1, 1)
         self.history_frames = init_video
         _, self.vae_wrap, self.vae_core = _get_vae_handles(model)
+        if getattr(args, "sequential_cpu_offload", False):
+            enable_sequential_cpu_offload(self.vae_core, model.tensor_kwargs.get("device", "cuda"))
         self.history_latents, self.enc_feat_cache = _prime_encoder_cache_with_history(
             init_video, self.vae_wrap, self.vae_core, model, args.offload
         )
@@ -1105,7 +1228,7 @@ class Lyra2InferencePipeline:
             offload_da3_model = bool(getattr(self.args, "offload_da3_model", False))
             if offload_da3:
                 _offload_diffusion_to_cpu(self.model, True)
-            if offload_da3_model:
+            if offload_da3_model and not getattr(self.args, "sequential_cpu_offload", False):
                 self.local_da3_model.to(self.model.tensor_kwargs.get("device", "cuda"))
             try:
                 da3_out = _predict_da3_depth_window(
@@ -1126,7 +1249,7 @@ class Lyra2InferencePipeline:
                     ),
                 )
             finally:
-                if offload_da3_model:
+                if offload_da3_model and not getattr(self.args, "sequential_cpu_offload", False):
                     self.local_da3_model.to("cpu")
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
