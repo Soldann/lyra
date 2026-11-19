@@ -147,6 +147,12 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--lora_paths", type=str, default=None, nargs="+")
     parser.add_argument("--lora_weights", type=float, default=None, nargs="+")
     parser.add_argument("--offload", action="store_true")
+    parser.add_argument(
+        "--sequential_cpu_offload",
+        action="store_true",
+        help="Keep each Lyra network module on CPU and move only its own "
+             "parameters/buffers to GPU during that module's forward.",
+    )
     parser.add_argument("--offload_vae", action="store_true")
     parser.add_argument("--offload_when_prompt", action="store_true")
     parser.add_argument("--debug", action="store_true")
@@ -215,12 +221,21 @@ def _apply_dmd_defaults(args):
 if __name__ == "__main__":
     args = parse_arguments()
     _apply_dmd_defaults(args)
-    if args.offload:
+    if args.sequential_cpu_offload:
+        os.environ["LYRA_MODEL_INIT_DEVICE"] = "cpu"
+        os.environ["LYRA_SKIP_MODEL_DEVICE_MOVE"] = "1"
+        args.offload_da3_model = True
+    elif args.offload:
         os.environ["LYRA_MODEL_INIT_DEVICE"] = "cpu"
         os.environ["LYRA_SKIP_MODEL_DEVICE_MOVE"] = "1"
         args.offload_da3_model = True
 
-    print(f"Loading models with offload settings: offload {args.offload}, vae {args.offload_vae}, offload_when_prompt {args.offload_when_prompt}, offload_da3_diffusion {args.offload_da3_diffusion}")
+    print(
+        f"Loading models with offload settings: offload {args.offload}, "
+        f"sequential_cpu_offload {args.sequential_cpu_offload}, "
+        f"vae {args.offload_vae}, offload_when_prompt {args.offload_when_prompt}, "
+        f"offload_da3_diffusion {args.offload_da3_diffusion}"
+    )
 
     if args.debug:
         import debugpy

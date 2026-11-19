@@ -403,6 +403,7 @@ def _restore_diffusion_to_gpu(model, enable_offload: bool):
         enable_offload
         and hasattr(model, "net")
         and not getattr(model, "_forward_offload_enabled", False)
+        and not getattr(model, "_sequential_cpu_offload_enabled", False)
     ):
         model.net.to(model.tensor_kwargs.get("device", "cuda"))
 
@@ -428,6 +429,66 @@ def _enable_forward_offload(model, enable_offload: bool):
     )
     model._forward_offload_enabled = True
     model.net.cpu()
+
+
+def _enable_sequential_cpu_offload(model, enable_offload: bool):
+    """Move each network module's own state to GPU only during its forward.
+
+    Unlike whole-network forward offload, this deliberately does not call
+    ``module.to(device)`` because that recursively moves child modules too.
+    """
+    if not enable_offload or not hasattr(model, "net"):
+        return
+    if getattr(model, "_sequential_cpu_offload_enabled", False):
+        return
+
+    device = torch.device(model.tensor_kwargs.get("device", "cuda"))
+
+    def move_direct_state(module, target):
+        for parameter in module.parameters(recurse=False):
+            parameter.data = parameter.data.to(device=target)
+        for name, buffer in module.named_buffers(recurse=False):
+            if buffer is not None:
+                module._buffers[name] = buffer.to(device=target)
+
+    def install_hooks(root):
+        handles = []
+
+        def move_to_device(module, _inputs):
+            move_direct_state(module, device)
+
+        def move_to_cpu(module, _inputs, _output):
+            move_direct_state(module, torch.device("cpu"))
+
+        for module in root.modules():
+            handles.extend(
+                (
+                    module.register_forward_pre_hook(move_to_device),
+                    module.register_forward_hook(move_to_cpu),
+                )
+            )
+        return tuple(handles)
+
+    net_handles = install_hooks(model.net)
+
+    vae_handles = ()
+    vae_iface = getattr(model, "tokenizer", None)
+    vae_wrap = getattr(vae_iface, "model", None)
+    vae_core = getattr(vae_wrap, "model", None)
+    if vae_core is not None:
+        vae_handles = install_hooks(vae_core)
+
+    model._sequential_cpu_offload_handles = net_handles + vae_handles
+    model._sequential_cpu_offload_enabled = True
+    model.net.cpu()
+    if vae_core is not None:
+        vae_core.cpu()
+    log.info(
+        f"Enabled sequential CPU offload for {sum(1 for _ in model.net.modules())} "
+        f"network modules and {sum(1 for _ in vae_core.modules()) if vae_core is not None else 0} "
+        "VAE modules.",
+        rank0_only=True,
+    )
 
 
 def safe_to(obj, device=None, dtype=None, skip_keys: set | None = None):
@@ -1457,7 +1518,10 @@ def run_lyra2_sample(
     vipe_input_dump_dir=None,
 ):
     """Shared Lyra2 autoregressive generation logic for a single prepared sample."""
-    _enable_forward_offload(model, bool(getattr(args, "offload", False)))
+    if bool(getattr(args, "sequential_cpu_offload", False)):
+        _enable_sequential_cpu_offload(model, True)
+    else:
+        _enable_forward_offload(model, bool(getattr(args, "offload", False)))
     model._normalize_video_databatch_inplace(data_batch)
 
     cp_group = None
