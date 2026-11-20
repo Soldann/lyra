@@ -121,6 +121,8 @@ def parse_arguments() -> argparse.Namespace:
                         help="Path to captions.json (or dir with per-image .json files). "
                              "JSON maps frame-index strings to caption text. "
                              "Each AR chunk uses the caption whose key is <= current frame.")
+    parser.add_argument("--pointcloud_path", type=str, default=None,
+                        help="Path to a point cloud file (e.g., .ply, .pcd). Used to bypass mono-depth estimation when available.")
     parser.add_argument("--prompt_suffix", type=str, default="",
                         help="Text appended to every prompt.")
 
@@ -381,18 +383,22 @@ if __name__ == "__main__":
         rgb_t = torch.from_numpy(rgb)
 
         # ---- Depth & intrinsics for the first frame (via DA3) ----
-        log.info("Running DA3 single-image depth...", rank0_only=True)
-        da3_model.to(desired_device)
-        try:
-            image_chw01, depth_hw, _K_33_da3, mask_hw = _da3_infer_depth_intrinsics_single(
-                da3_model=da3_model,
-                img_rgb_uint8=rgb_t,
-                target_hw=(target_h, target_w),
-            )
-        finally:
-            da3_model.to("cpu")
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+        if args.pointcloud_path:
+            log.info("Pointcloud provided, using instead of single-image depth")
+            points, color = np.load(args.pointcloud_path)
+        else:
+            log.info("Running DA3 single-image depth...", rank0_only=True)
+            da3_model.to(desired_device)
+            try:
+                image_chw01, depth_hw, _K_33_da3, mask_hw = _da3_infer_depth_intrinsics_single(
+                    da3_model=da3_model,
+                    img_rgb_uint8=rgb_t,
+                    target_hw=(target_h, target_w),
+                )
+            finally:
+                da3_model.to("cpu")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
         H, W = image_chw01.shape[-2:]
 
         # ---- Optionally align DA3 depth to MoGe scale ----
